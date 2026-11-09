@@ -1,0 +1,608 @@
+import { ipcMain, shell, type IpcMainInvokeEvent } from '@kaminide/host-compat'
+import path from 'path'
+import fs from 'fs'
+import os from 'os'
+import {
+  loadEnabledPluginsMap,
+  decodeYamlScalar,
+  parseYamlList,
+  parseYamlBool,
+  parseYamlInt,
+  extractFrontmatter,
+  firstBodyLine,
+  matchYamlField,
+  readEffectivePluginManifest,
+} from '../plugin-helpers'
+import type { TabManager } from '../tab-manager'
+import { createSkillFile, deleteSkillFile, type SkillRoots } from './skill-files'
+
+export interface SkillsAgentsContext {
+  getTabManager: () => TabManager | null
+  getUserCwd: () => string | null
+}
+
+let skillsCache: { at: number; rows: unknown[] } | null = null
+let skillsInFlight: Promise<unknown[]> | null = null
+let skillsCacheGeneration = 0
+const SKILLS_TTL_MS = 30_000
+
+/** Drop discovery results after any plugin mutation. An in-flight scan may
+ * still resolve for its original caller, but its generation can no longer
+ * repopulate the shared cache with stale plugin state. */
+export function invalidateSkillsCache(): void {
+  skillsCache = null
+  skillsInFlight = null
+  skillsCacheGeneration += 1
+}
+
+function resolvePluginComponentPath(pluginRoot: string, ref: string): string | null {
+  const resolved = path.isAbsolute(ref) ? path.resolve(ref) : path.resolve(pluginRoot, ref)
+  const relative = path.relative(path.resolve(pluginRoot), resolved)
+  return relative === '' || (relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative))
+    ? resolved
+    : null
+}
+
+export function registerSkillsAgentsIPC(ctx: SkillsAgentsContext): void {
+  function skillRoots(): SkillRoots {
+    const cwd = ctx.getUserCwd()
+    return {
+      projectClaudeDir: cwd ? path.join(cwd, '.claude') : null,
+      userClaudeDir: path.join(os.homedir(), '.claude'),
+    }
+  }
+
+  // Кэш skills:list: полный рекурсивный обход ~/.claude/plugins + команд + skills
+  // (сотни-тысячи readFile) стоил ~10с и запускался ЗАНОВО на КАЖДОЙ открытой
+  // странице настроек (useInit каждой customize-вью). Держим последний
+  // результат + дедуп конкурентных вызовов (один in-flight промис): страницы
+  // настроек, открываемые подряд, переиспользуют один скан. TTL 30с — свежий
+  // плагин/скилл подхватится при следующем открытии после протухания.
+  ipcMain.handle('skills:list', async () => {
+    const now = Date.now()
+    if (skillsCache && now - skillsCache.at < SKILLS_TTL_MS) return skillsCache.rows
+    if (skillsInFlight) return skillsInFlight
+    const generation = skillsCacheGeneration
+    const request = scanSkills().then((rows) => {
+      if (generation === skillsCacheGeneration) skillsCache = { at: Date.now(), rows }
+      return rows
+    }).finally(() => {
+      if (skillsInFlight === request) skillsInFlight = null
+    })
+    skillsInFlight = request
+    return request
+  })
+
+  async function scanSkills(): Promise<unknown[]> {
+    type SkillRow = {
+      name: string
+      fileName: string
+      description: string
+      path: string
+      source: string
+      /** Raw `name:` field from frontmatter (if author supplied one). CLI's
+       *  `userFacingName()` falls back to this and `findCommand` matches it,
+       *  so when present we prefer it as the user-visible slash form
+       *  (mirrors what the CLI's own typeahead inserts). */
+      displayName?: string
+      argumentHint?: string
+      shell?: string
+      version?: string
+      whenToUse?: string
+      disableModelInvocation?: boolean
+    }
+
+    function parseSkillContent(filePath: string, fileName: string, source: string, content: string, overrideName?: string): SkillRow | null {
+      const fm = extractFrontmatter(content) ?? ''
+      const match = (key: string): string | undefined => matchYamlField(fm, key)
+      const userInvocable = match('user-invocable')
+      if (userInvocable && parseYamlBool(userInvocable) === false) return null
+
+      const rawName = match('name')?.trim().replace(/^["']|["']$/g, '')
+      const name = overrideName ?? rawName ?? fileName.replace(/\.md$/, '')
+      let description = match('description')
+      description = description ? decodeYamlScalar(description) : firstBodyLine(content, fileName)
+
+      const row: SkillRow = {
+        name, fileName, description, path: filePath, source,
+      }
+      if (rawName) row.displayName = rawName
+      const argumentHint = match('argument-hint') ?? match('argumentHint')
+      if (argumentHint) row.argumentHint = decodeYamlScalar(argumentHint)
+      const shellMeta = match('shell')
+      if (shellMeta) row.shell = decodeYamlScalar(shellMeta)
+      const version = match('version')
+      if (version) row.version = decodeYamlScalar(version)
+      const whenToUse = match('when_to_use') ?? match('whenToUse')
+      if (whenToUse) row.whenToUse = decodeYamlScalar(whenToUse)
+      const disableModelInvocation = match('disable-model-invocation') ?? match('disableModelInvocation')
+      if (disableModelInvocation) {
+        const b = parseYamlBool(disableModelInvocation)
+        if (b !== null) row.disableModelInvocation = b
+      }
+      return row
+    }
+
+    async function safeReadFile(p: string): Promise<string | null> {
+      try { return await fs.promises.readFile(p, 'utf-8') } catch { return null }
+    }
+
+    const enabledPlugins = await loadEnabledPluginsMap()
+
+    async function scanSkillDirs(skillsDir: string, source: string): Promise<SkillRow[]> {
+      let dirs: import('fs').Dirent[]
+      try { dirs = (await fs.promises.readdir(skillsDir, { withFileTypes: true })).filter(d => d.isDirectory()) }
+      catch { return [] }
+      const rows = await Promise.all(dirs.map(async (d): Promise<SkillRow | null> => {
+        const skillMd = path.join(skillsDir, d.name, 'SKILL.md')
+        const content = await safeReadFile(skillMd)
+        if (content === null) return null
+        return parseSkillContent(skillMd, d.name, source, content, d.name)
+      }))
+      return rows.filter((r): r is SkillRow => r !== null)
+    }
+
+    const { projectClaudeDir, userClaudeDir } = skillRoots()
+    const projectPromise = (async (): Promise<SkillRow[]> => {
+      if (!projectClaudeDir) return []
+      // Legacy `.claude/commands/*.md` still load in the CLI next to skills.
+      const commandsDir = path.join(projectClaudeDir, 'commands')
+      let files: string[] = []
+      try { files = (await fs.promises.readdir(commandsDir)).filter(f => f.endsWith('.md')) }
+      catch { /* no dir */ }
+      const [commands, skills] = await Promise.all([
+        Promise.all(files.map(async (f): Promise<SkillRow | null> => {
+          const filePath = path.join(commandsDir, f)
+          const content = await safeReadFile(filePath)
+          if (content === null) return null
+          return parseSkillContent(filePath, f, 'project', content)
+        })),
+        scanSkillDirs(path.join(projectClaudeDir, 'skills'), 'project'),
+      ])
+      return [...skills, ...commands.filter((r): r is SkillRow => r !== null)]
+    })()
+
+    const userPromise = scanSkillDirs(path.join(userClaudeDir, 'skills'), 'user')
+
+    const pluginsFile = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json')
+    const pluginsPromise = (async (): Promise<SkillRow[]> => {
+      const raw = await safeReadFile(pluginsFile)
+      if (!raw) return []
+      let data: any
+      try { data = JSON.parse(raw) } catch { return [] }
+      if (data.version !== 2 || !data.plugins) return []
+
+      async function scanCommandsDir(dir: string, prefix = ''): Promise<{ relName: string; filePath: string }[]> {
+        let entries: import('fs').Dirent[]
+        try { entries = await fs.promises.readdir(dir, { withFileTypes: true }) }
+        catch { return [] }
+        const nested = await Promise.all(entries.map(async (e) => {
+          if (e.isDirectory()) {
+            return scanCommandsDir(path.join(dir, e.name), prefix ? `${prefix}/${e.name}` : e.name)
+          }
+          if (e.name.endsWith('.md')) {
+            const name = e.name.replace(/\.md$/, '')
+            return [{ relName: prefix ? `${prefix}/${name}` : name, filePath: path.join(dir, e.name) }]
+          }
+          return [] as { relName: string; filePath: string }[]
+        }))
+        return nested.flat()
+      }
+
+      async function scanSkillFiles(dir: string): Promise<string[]> {
+        let entries: import('fs').Dirent[]
+        try { entries = await fs.promises.readdir(dir, { withFileTypes: true }) }
+        catch { return [] }
+        const nested = await Promise.all(entries.map(async (entry): Promise<string[]> => {
+          const full = path.join(dir, entry.name)
+          if (entry.isDirectory()) return scanSkillFiles(full)
+          return entry.isFile() && entry.name.toLowerCase() === 'skill.md' ? [full] : []
+        }))
+        return nested.flat()
+      }
+
+      const perPlugin = await Promise.all(
+        Object.entries(data.plugins as Record<string, any[]>).map(async ([key, entries]) => {
+          if (enabledPlugins.get(key) === false) return []
+          const at = key.lastIndexOf('@')
+          const pluginName = at > 0 ? key.slice(0, at) : key
+          const marketplace = at > 0 ? key.slice(at + 1) : ''
+          const entry = entries[0]
+          if (!entry?.installPath) return []
+          const pluginRoot = entry.installPath
+          const rows: SkillRow[] = []
+
+          const manifest = await readEffectivePluginManifest(pluginRoot, pluginName, marketplace)
+
+          const commandsDirLocal = path.join(pluginRoot, 'commands')
+          const cmds = manifest.commands === undefined ? await scanCommandsDir(commandsDirLocal) : []
+          const scanRows = await Promise.all(cmds.map(async (cmd): Promise<SkillRow | null> => {
+            const content = await safeReadFile(cmd.filePath)
+            if (content === null) return null
+            return parseSkillContent(
+              cmd.filePath,
+              path.basename(cmd.filePath),
+              `plugin:${pluginName}`,
+              content,
+              cmd.relName,
+            )
+          }))
+          for (const r of scanRows) if (r) rows.push(r)
+
+          const marketplaceRootSource = fs.existsSync(path.join(pluginRoot, '.claude-plugin', 'marketplace.json'))
+          const skillRefs = [
+            ...(!(marketplaceRootSource && manifest.skills !== undefined) ? ['skills'] : []),
+            ...(Array.isArray(manifest.skills) ? manifest.skills : [manifest.skills]).filter((v): v is string => typeof v === 'string'),
+          ]
+          const skillPaths = new Set<string>()
+          for (const ref of skillRefs) {
+            const resolved = path.resolve(pluginRoot, ref)
+            const relative = path.relative(pluginRoot, resolved)
+            if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) continue
+            let stat: fs.Stats
+            try { stat = await fs.promises.stat(resolved) } catch { continue }
+            if (stat.isDirectory()) {
+              for (const filePath of await scanSkillFiles(resolved)) skillPaths.add(filePath)
+            } else if (stat.isFile() && path.basename(resolved).toLowerCase() === 'skill.md') {
+              skillPaths.add(resolved)
+            }
+          }
+          for (const skillMd of skillPaths) {
+            const content = await safeReadFile(skillMd)
+            if (content === null) continue
+            const skillName = path.basename(path.dirname(skillMd))
+            const parsed = parseSkillContent(skillMd, skillName, `plugin:${pluginName}`, content, skillName)
+            if (parsed) rows.push(parsed)
+          }
+
+          const spec = manifest?.commands
+          const items: unknown[] = Array.isArray(spec) ? spec
+            : (typeof spec === 'string' || (spec && typeof spec === 'object' && !Array.isArray(spec))) ? [spec]
+            : []
+          const seenPaths = new Set(scanRows.filter(Boolean).map(r => (r as SkillRow).path))
+          for (const item of items) {
+            if (typeof item === 'string') {
+              const resolved = resolvePluginComponentPath(pluginRoot, item)
+              if (!resolved) continue
+              let stat: fs.Stats
+              try { stat = await fs.promises.stat(resolved) } catch { continue }
+              const declared = stat.isDirectory()
+                ? await scanCommandsDir(resolved)
+                : [{ relName: path.basename(resolved, '.md'), filePath: resolved }]
+              for (const command of declared) {
+                const content = await safeReadFile(command.filePath)
+                if (content === null || seenPaths.has(command.filePath)) continue
+                const parsed = parseSkillContent(
+                  command.filePath,
+                  path.basename(command.filePath),
+                  `plugin:${pluginName}`,
+                  content,
+                  command.relName,
+                )
+                if (parsed) { rows.push(parsed); seenPaths.add(command.filePath) }
+              }
+            } else if (item && typeof item === 'object' && !Array.isArray(item)) {
+              for (const [cmdName, meta] of Object.entries(item as Record<string, any>)) {
+                if (!meta || typeof meta !== 'object') continue
+                const srcPath = typeof meta.source === 'string'
+                  ? resolvePluginComponentPath(pluginRoot, meta.source)
+                  : null
+                let content: string | null = null
+                if (srcPath) content = await safeReadFile(srcPath)
+                else if (typeof meta.content === 'string') content = meta.content
+                if (content === null) continue
+                const row = parseSkillContent(
+                  srcPath ?? path.join(pluginRoot, `${cmdName}.md`),
+                  srcPath ? path.basename(srcPath) : `${cmdName}.md`,
+                  `plugin:${pluginName}`,
+                  content,
+                  cmdName,
+                )
+                if (!row) continue
+                if (typeof meta.description === 'string') row.description = meta.description
+                if (typeof meta['argument-hint'] === 'string') row.argumentHint = meta['argument-hint']
+                if (typeof meta.shell === 'string') row.shell = meta.shell
+                if (typeof meta.version === 'string') row.version = meta.version
+                rows.push(row)
+              }
+            }
+          }
+          return rows
+        }),
+      )
+      return perPlugin.flat()
+    })()
+
+    const [project, user, plugins] = await Promise.all([projectPromise, userPromise, pluginsPromise])
+    return [...project, ...user, ...plugins]
+  }
+
+  // List subagents available to the CLI.
+  ipcMain.handle('agents:list', async () => {
+    interface AgentInfo {
+      name: string
+      fileName: string
+      description: string
+      model: string | null
+      tools: string[]
+      path: string
+      source: string
+      color?: string
+      effort?: string | number
+      maxTurns?: number
+      disallowedTools?: string[]
+      memory?: string
+      isolation?: string
+      background?: boolean
+      skills?: string[]
+    }
+
+    async function parseAgent(filePath: string, source: string, overrideName?: string, contentOverride?: string): Promise<AgentInfo | null> {
+      let content: string
+      if (typeof contentOverride === 'string') content = contentOverride
+      else {
+        try { content = await fs.promises.readFile(filePath, 'utf-8') } catch { return null }
+      }
+      const fm = extractFrontmatter(content) ?? ''
+      const match = (key: string): string | undefined => matchYamlField(fm, key)
+      const fileName = path.basename(filePath)
+      let name = overrideName ?? fileName.replace(/\.md$/, '')
+      let description = ''
+      let model: string | null = null
+      let tools: string[] = []
+
+      const nameMatch = match('name')
+      const descMatch = match('description')
+      const whenMatch = match('when-to-use') ?? match('when_to_use')
+      const modelMatch = match('model')
+      const toolsMatch = match('tools')
+      if (nameMatch && !overrideName) name = decodeYamlScalar(nameMatch)
+      if (descMatch) description = decodeYamlScalar(descMatch)
+      if (!description && whenMatch) description = decodeYamlScalar(whenMatch)
+      if (modelMatch) model = decodeYamlScalar(modelMatch)
+      if (toolsMatch) tools = parseYamlList(toolsMatch)
+
+      if (!description) description = firstBodyLine(content, '')
+
+      const info: AgentInfo = { name, fileName, description, model, tools, path: filePath, source }
+
+      const colorMatch = match('color')
+      if (colorMatch) info.color = decodeYamlScalar(colorMatch)
+      const effortMatch = match('effort')
+      if (effortMatch) {
+        const n = parseYamlInt(effortMatch)
+        info.effort = n !== null ? n : decodeYamlScalar(effortMatch)
+      }
+      const maxTurnsMatch = match('maxTurns') ?? match('max-turns')
+      if (maxTurnsMatch) {
+        const n = parseYamlInt(maxTurnsMatch)
+        if (n !== null) info.maxTurns = n
+      }
+      const disallowedMatch = match('disallowedTools') ?? match('disallowed-tools')
+      if (disallowedMatch) info.disallowedTools = parseYamlList(disallowedMatch)
+      const memoryMatch = match('memory')
+      if (memoryMatch) info.memory = decodeYamlScalar(memoryMatch)
+      const isolationMatch = match('isolation')
+      if (isolationMatch) info.isolation = decodeYamlScalar(isolationMatch)
+      const backgroundMatch = match('background')
+      if (backgroundMatch) {
+        const b = parseYamlBool(backgroundMatch)
+        if (b !== null) info.background = b
+      }
+      const skillsMatch = match('skills')
+      if (skillsMatch) info.skills = parseYamlList(skillsMatch)
+      return info
+    }
+
+    async function scanAgentsDir(dir: string, source: string): Promise<AgentInfo[]> {
+      let files: import('fs').Dirent[]
+      try { files = await fs.promises.readdir(dir, { withFileTypes: true }) }
+      catch { return [] }
+      const mdFiles = files.filter(f => f.isFile() && f.name.endsWith('.md'))
+      const parsed = await Promise.all(mdFiles.map(f => parseAgent(path.join(dir, f.name), source)))
+      return parsed.filter((p): p is AgentInfo => p !== null)
+    }
+
+    const enabledPluginsForAgents = await loadEnabledPluginsMap()
+    const tm = ctx.getTabManager()
+
+    const projectCwds = new Set<string>()
+    const userCwd = ctx.getUserCwd()
+    if (userCwd) projectCwds.add(userCwd)
+    try {
+      for (const cwd of tm?.getDistinctCwds() ?? []) projectCwds.add(cwd)
+    } catch { /* tabManager may not be ready */ }
+    const projectPromise = Promise.all(
+      [...projectCwds].map(cwd => scanAgentsDir(path.join(cwd, '.claude', 'agents'), 'project')),
+    ).then(arrs => arrs.flat())
+
+    const userPromise = scanAgentsDir(path.join(os.homedir(), '.claude', 'agents'), 'user')
+
+    const pluginsPromise = (async (): Promise<AgentInfo[]> => {
+      const pluginsFile = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json')
+      let raw: string
+      try { raw = await fs.promises.readFile(pluginsFile, 'utf-8') } catch { return [] }
+      let data: any
+      try { data = JSON.parse(raw) } catch { return [] }
+      if (data.version !== 2 || !data.plugins) return []
+
+      const perPlugin = await Promise.all(
+        Object.entries(data.plugins as Record<string, any[]>).map(async ([key, entries]) => {
+          if (enabledPluginsForAgents.get(key) === false) return []
+          const at = key.lastIndexOf('@')
+          const pluginName = at > 0 ? key.slice(0, at) : key
+          const marketplace = at > 0 ? key.slice(at + 1) : ''
+          const entry = entries[0]
+          if (!entry?.installPath) return []
+          const pluginRoot = entry.installPath
+          const manifest = await readEffectivePluginManifest(pluginRoot, pluginName, marketplace)
+          const scanned = manifest.agents === undefined
+            ? await scanAgentsDir(path.join(pluginRoot, 'agents'), `plugin:${pluginName}`)
+            : []
+          const seenPaths = new Set(scanned.map(a => a.path))
+
+          const spec = manifest?.agents
+          const items: unknown[] = Array.isArray(spec) ? spec
+            : (typeof spec === 'string' || (spec && typeof spec === 'object' && !Array.isArray(spec))) ? [spec]
+            : []
+          for (const item of items) {
+            if (typeof item === 'string') {
+              const resolved = resolvePluginComponentPath(pluginRoot, item)
+              if (!resolved) continue
+              let stat: fs.Stats
+              try { stat = await fs.promises.stat(resolved) } catch { continue }
+              if (stat.isDirectory()) {
+                for (const parsed of await scanAgentsDir(resolved, `plugin:${pluginName}`)) {
+                  if (!seenPaths.has(parsed.path)) { scanned.push(parsed); seenPaths.add(parsed.path) }
+                }
+              } else if (!seenPaths.has(resolved)) {
+                const parsed = await parseAgent(resolved, `plugin:${pluginName}`)
+                if (parsed) { scanned.push(parsed); seenPaths.add(resolved) }
+              }
+            } else if (item && typeof item === 'object' && !Array.isArray(item)) {
+              for (const [agentName, meta] of Object.entries(item as Record<string, any>)) {
+                if (!meta || typeof meta !== 'object') continue
+                const srcPath = typeof meta.source === 'string'
+                  ? resolvePluginComponentPath(pluginRoot, meta.source)
+                  : null
+                const contentOverride = typeof meta.content === 'string' ? meta.content : undefined
+                const parsed = await parseAgent(
+                  srcPath ?? path.join(pluginRoot, `${agentName}.md`),
+                  `plugin:${pluginName}`,
+                  agentName,
+                  contentOverride,
+                )
+                if (!parsed) continue
+                if (typeof meta.description === 'string') parsed.description = meta.description
+                if (typeof meta.model === 'string') parsed.model = meta.model
+                if (typeof meta.color === 'string') parsed.color = meta.color
+                scanned.push(parsed)
+              }
+            }
+          }
+          return scanned
+        }),
+      )
+      return perPlugin.flat()
+    })()
+
+    const [project, user, plugins] = await Promise.all([projectPromise, userPromise, pluginsPromise])
+    return [...project, ...user, ...plugins]
+  })
+
+  // Plugin-shipped output styles.
+  ipcMain.handle('output-styles:list', async () => {
+    type StyleRow = { name: string; description: string; path: string; source: string }
+    const rows: StyleRow[] = []
+    const enabled = await loadEnabledPluginsMap()
+    const pluginsFile = path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json')
+    let raw: string
+    try { raw = await fs.promises.readFile(pluginsFile, 'utf-8') } catch { return [] }
+    let data: any
+    try { data = JSON.parse(raw) } catch { return [] }
+    if (data.version !== 2 || !data.plugins) return []
+
+    async function readMdMeta(p: string): Promise<{ description: string } | null> {
+      let content: string
+      try { content = await fs.promises.readFile(p, 'utf-8') } catch { return null }
+      const fm = extractFrontmatter(content) ?? ''
+      const desc = matchYamlField(fm, 'description')
+      return {
+        description: desc || firstBodyLine(content, ''),
+      }
+    }
+
+    for (const [key, entries] of Object.entries(data.plugins as Record<string, any[]>)) {
+      if (enabled.get(key) === false) continue
+      const at = key.lastIndexOf('@')
+      const pluginName = at > 0 ? key.slice(0, at) : key
+      const marketplace = at > 0 ? key.slice(at + 1) : ''
+      const entry = entries[0]
+      if (!entry?.installPath) continue
+      const pluginRoot = entry.installPath
+      const source = `plugin:${pluginName}`
+
+      const manifest = await readEffectivePluginManifest(pluginRoot, pluginName, marketplace)
+
+      if (manifest.outputStyles === undefined) {
+        const stylesDir = path.join(pluginRoot, 'output-styles')
+        try {
+          const files = await fs.promises.readdir(stylesDir, { withFileTypes: true })
+          for (const f of files) {
+            if (!f.isFile() || !f.name.endsWith('.md')) continue
+            const fp = path.join(stylesDir, f.name)
+            const meta = await readMdMeta(fp)
+            if (!meta) continue
+            rows.push({ name: f.name.replace(/\.md$/, ''), description: meta.description, path: fp, source })
+          }
+        } catch { /* no dir */ }
+      }
+
+      const spec = manifest?.outputStyles
+      const items: unknown[] = Array.isArray(spec) ? spec
+        : (typeof spec === 'string' || (spec && typeof spec === 'object' && !Array.isArray(spec))) ? [spec]
+        : []
+      for (const item of items) {
+        if (typeof item === 'string') {
+          const resolved = resolvePluginComponentPath(pluginRoot, item)
+          if (!resolved) continue
+          let stat: fs.Stats
+          try { stat = await fs.promises.stat(resolved) } catch { continue }
+          const files = stat.isDirectory()
+            ? (await fs.promises.readdir(resolved, { withFileTypes: true }))
+              .filter(file => file.isFile() && file.name.endsWith('.md'))
+              .map(file => path.join(resolved, file.name))
+            : [resolved]
+          for (const filePath of files) {
+            const meta = await readMdMeta(filePath)
+            if (!meta) continue
+            rows.push({ name: path.basename(filePath, '.md'), description: meta.description, path: filePath, source })
+          }
+        } else if (item && typeof item === 'object' && !Array.isArray(item)) {
+          for (const [styleName, m] of Object.entries(item as Record<string, any>)) {
+            if (!m || typeof m !== 'object') continue
+            const srcPath = typeof m.source === 'string'
+              ? resolvePluginComponentPath(pluginRoot, m.source)
+              : null
+            const description = typeof m.description === 'string' ? m.description
+              : (srcPath ? (await readMdMeta(srcPath))?.description ?? '' : '')
+            rows.push({
+              name: styleName,
+              description,
+              path: srcPath ?? path.join(pluginRoot, `${styleName}.md`),
+              source,
+            })
+          }
+        }
+      }
+    }
+    return rows
+  })
+
+  ipcMain.handle('skills:create', (_event: IpcMainInvokeEvent, name: string, content: string) => {
+    const created = createSkillFile(skillRoots(), name, content)
+    invalidateSkillsCache()
+    return created
+  })
+
+  ipcMain.handle('skills:delete', (_event: IpcMainInvokeEvent, skillPath: string) => {
+    deleteSkillFile(skillRoots(), skillPath)
+    invalidateSkillsCache()
+  })
+
+  ipcMain.handle('skills:open', (_event: IpcMainInvokeEvent, filePath: string) => {
+    shell.openPath(filePath)
+  })
+
+  ipcMain.handle('skills:show-in-folder', (_event: IpcMainInvokeEvent, filePath: string) => {
+    shell.showItemInFolder(filePath)
+  })
+
+  ipcMain.handle('skills:read', (_event: IpcMainInvokeEvent, filePath: string) => {
+    try {
+      return fs.readFileSync(filePath, 'utf-8')
+    } catch {
+      return null
+    }
+  })
+}

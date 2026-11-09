@@ -1,0 +1,150 @@
+import { describe, it, expect } from 'vitest'
+import { computeContextStats, contextLimitForModel, costForUsage, tierForModel } from './session-cost'
+
+describe('cache TTL and side-call accounting', () => {
+  it('matches real CLI one-hour writes and prices mixed TTLs independently', () => {
+    const tier = tierForModel('claude-haiku-5-5')
+    expect(costForUsage({ input_tokens: 2, output_tokens: 4,
+      cache_creation_input_tokens: 57871,
+      cache_creation: { ephemeral_1h_input_tokens: 57871 } }, tier)).toBeCloseTo(0.0115764, 10)
+    const mixed = { cache_creation_input_tokens: 1000,
+      cache_creation: { ephemeral_5m_input_tokens: 600, ephemeral_1h_input_tokens: 400 } }
+    expect(costForUsage(mixed, tier)).toBeCloseTo((600 * 0.125 + 400 * 0.2) / 1e6, 10)
+    expect(costForUsage({ cache_creation_input_tokens: 1000 }, tier)).toBeCloseTo(0.000125, 10)
+  })
+
+  it('counts side-calls and final streaming output once while retaining main context', () => {
+    const main = turn('main', 1000, { output: 10 })
+    const final = turn('main', 1000, { output: 100 })
+    const child = { ...turn('child', 90000, { output: 200 }), isSidechain: true }
+    const stats = computeContextStats([main, child, final, child], true, TAB_MODEL)!
+    expect(stats.used).toBe(1000)
+    expect(stats.cost).toBeCloseTo(costForUsage(final.message.usage, tierForModel(TAB_MODEL)) +
+      costForUsage(child.message.usage, tierForModel(TAB_MODEL)), 10)
+  })
+})
+
+// One assistant turn on the 1M Opus tier. `used` = input + cache_read + cache_creation.
+const turn = (msgId: string, inputTok: number, opts: { output?: number; cacheRead?: number } = {}) => ({
+  type: 'assistant',
+  model: 'claude-opus-5',
+  message: {
+    id: msgId,
+    usage: {
+      input_tokens: inputTok,
+      output_tokens: opts.output ?? 0,
+      cache_read_input_tokens: opts.cacheRead ?? 0,
+      cache_creation_input_tokens: 0,
+    },
+  },
+})
+
+const TAB_MODEL = 'claude-opus-5' // 1M нативно (4.8[1m]-вариантов больше нет)
+
+describe('computeContextStats — live segment tracks the LATEST turn (the /compact-freeze fix)', () => {
+  it('after a /compact the bar follows the window DOWN, not stuck at the pre-compact peak', () => {
+    // context climbed to 994K, /compact collapsed it, post-compact turns are ~64K.
+    const entries = [
+      turn('m1', 500_000),
+      turn('m2', 994_000), // pre-compact high-water mark
+      turn('m3', 64_000),  // first post-compact turn
+      turn('m4', 66_000),  // latest
+    ]
+    const s = computeContextStats(entries, /* isLiveSegment */ true, TAB_MODEL)!
+    expect(s.used).toBe(66_000)         // latest, NOT the 994K peak
+    expect(s.pct).toBe(7)               // 66K / 1M
+    expect(s.limit).toBe(1_000_000)
+  })
+
+  it('keeps moving as new turns arrive (does not latch)', () => {
+    expect(computeContextStats([turn('m1', 994_000), turn('m2', 60_000)], true, TAB_MODEL)!.used).toBe(60_000)
+    expect(computeContextStats([turn('m1', 994_000), turn('m2', 70_000)], true, TAB_MODEL)!.used).toBe(70_000)
+  })
+})
+
+describe('computeContextStats — archived segment keeps the PEAK', () => {
+  it('shows how full the sub-conversation got before it was compacted', () => {
+    const entries = [turn('m1', 500_000), turn('m2', 994_000), turn('m3', 300_000)]
+    const s = computeContextStats(entries, /* isLiveSegment */ false, TAB_MODEL)!
+    expect(s.used).toBe(994_000) // peak, not the 300K tail
+    expect(s.pct).toBe(99)
+  })
+})
+
+describe('computeContextStats — general', () => {
+  it('returns null when no assistant turn carries usage', () => {
+    expect(computeContextStats([{ type: 'user' }, { type: 'assistant' }], true, TAB_MODEL)).toBeNull()
+  })
+
+  it('skips <synthetic> rows so the bar does not collapse to 0%', () => {
+    const entries = [
+      turn('m1', 64_000),
+      { type: 'assistant', model: '<synthetic>', message: { id: 's', usage: { input_tokens: 0 } } },
+    ]
+    expect(computeContextStats(entries, true, TAB_MODEL)!.used).toBe(64_000)
+  })
+
+  it('dedups cost by message.id (parallel tool_use blocks share one usage)', () => {
+    // Same turn emitted as 3 rows sharing message.id — cost counted once.
+    const one = computeContextStats([turn('m1', 1000, { output: 1000 })], true, TAB_MODEL)!.cost
+    const three = computeContextStats(
+      [turn('m1', 1000, { output: 1000 }), turn('m1', 1000, { output: 1000 }), turn('m1', 1000, { output: 1000 })],
+      true, TAB_MODEL)!.cost
+    expect(three).toBeCloseTo(one, 10)
+  })
+
+  it('Opus 5: 1M window нативно, без [1m]-тега', () => {
+    const s = computeContextStats([turn('m1', 500_000)], true, TAB_MODEL)!
+    expect(s.limit).toBe(1_000_000)
+    expect(s.pct).toBe(50)
+  })
+})
+
+describe('Opus 5.5 estimates', () => {
+  it('uses the new published pricing without changing historical Opus 5 costs', () => {
+    expect(tierForModel('claude-opus-5-5')).toEqual({ input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2 })
+    expect(tierForModel('claude-opus-5')).toEqual({ input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 })
+  })
+
+  it('uses the native 1M context window for Opus 5.5', () => {
+    expect(contextLimitForModel('claude-opus-5-5')).toBe(1_000_000)
+  })
+})
+
+describe('Fable 5.1 estimates', () => {
+  it('uses the published cache-read rate and native 1M window', () => {
+    expect(tierForModel('claude-fable-5-1')).toEqual({ input: 10, output: 50, cacheWrite: 12.5, cacheRead: 0.25 })
+    expect(contextLimitForModel('claude-fable-5-1')).toBe(1_000_000)
+  })
+})
+
+describe('Sonnet 5.5 estimates', () => {
+  it('uses the published Sonnet 5 rates without repricing older Sonnet logs', () => {
+    expect(tierForModel('claude-sonnet-5-5')).toEqual({ input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.1 })
+    expect(tierForModel('claude-sonnet-5')).toEqual({ input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.2 })
+    expect(tierForModel('claude-sonnet-4-6')).toEqual({ input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3 })
+  })
+
+  it('uses the native 1M context window for Sonnet 5.5', () => {
+    expect(contextLimitForModel('claude-sonnet-5-5')).toBe(1_000_000)
+  })
+})
+
+describe('Haiku 5.5 estimates', () => {
+  it('prices prompts up to 100K at the base rate and longer prompts at the long rate', () => {
+    const tier = tierForModel('claude-haiku-5-5')
+    // 50K input + 10K output: 0.05 * 0.1 + 0.01 * 0.5
+    expect(costForUsage({ input_tokens: 50_000, output_tokens: 10_000 }, tier)).toBeCloseTo(0.01, 6)
+    // 150K prompt (cache read counts toward it): whole request at $0.50/$2.50, reads $0.05
+    expect(
+      costForUsage({ input_tokens: 50_000, cache_read_input_tokens: 100_000, output_tokens: 10_000 }, tier),
+    ).toBeCloseTo(0.05 * 0.5 + 0.1 * 0.05 + 0.01 * 2.5, 6)
+    // Haiku 4.5 logs keep their own flat rate
+    expect(tierForModel('claude-haiku-4-5')).toEqual({ input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 })
+  })
+
+  it('uses the 1M context window for Haiku 5.5 and keeps Haiku 4.5 at 200K', () => {
+    expect(contextLimitForModel('claude-haiku-5-5')).toBe(1_000_000)
+    expect(contextLimitForModel('claude-haiku-4-5')).toBe(200_000)
+  })
+})
