@@ -132,6 +132,9 @@ The real shared-runtime integration uses authenticated HTTP/WebSocket transport,
 actual tools and temporary project/HOME directories. It verifies pinned identity,
 Read/Write/Edit/Glob, Bash, external MCP cancellation, zero-page lifetime,
 transcript/stream/prompt recovery, once-only submissions and terminal cleanup.
+The LSP integration installs an isolated synthetic stdio plugin and exercises
+discovery, hover/definition/references/diagnostics, document changes, shared and
+separate project processes, zero-page continuation and identified-session cleanup.
 Its upstream protocol peer is synthetic; it is not live Claude acceptance.
 
 Production browser smoke uses the real asset handler and boundary with an
@@ -150,9 +153,44 @@ and [inventory extractor](test/capability-inventory.ts).
 Current `test:parity` passes its declared provider prerequisites:
 host terminals, title regeneration, finished-toast routing and PREVIEW/HMR.
 Deleting any of these four requirements fails both classification and readiness
-checks. It does **not** encode the remaining full host-page behavior
-gates. A green command therefore cannot close the owner task. Add these requirements
-and exhaustive observable behavior coverage before claiming full parity.
+checks. A green command cannot close the owner task.
+
+`npm run test:parity:complete` is the separate strict completion gate. With no
+execution receipt it exits 1 and lists missing proof; this is the current expected
+result. It requires an individually named passing assertion for every supported
+inventory row, seven host-state/lifetime contracts and 22 composed live scenarios.
+Reviewed native exclusions need no browser proof. Existing file/context services
+remain in the inventory; the removed FilePanel/explorer UI is not reintroduced.
+The gate tests run in normal `npm test`; CI retains its existing prerequisite gate.
+
+After the missing suites implement and execute those assertions, validate their
+sanitized artifact outside the checkout:
+
+```sh
+npm run test:parity:complete -- --receipt /private/acceptance/completion.json
+```
+
+The [receipt schema and required IDs](test/full-parity.ts) bind a clean full runner
+SHA to the same image revision and immutable image ID, Linux/browser execution,
+exit 0 and empty cleanup failures. Each check contains `id`, `status`, `test` and
+`assertion`; only PASS with nonempty test/assertion names qualifies. Missing,
+unknown, duplicate, failed, skipped, blocked and stale evidence rejects completion.
+Failure output omits arbitrary receipt text. Receipts are limited to 4 MiB.
+The existing live harness emits a partial `completion.json` beside its summary,
+preserving each executed scenario's actual status. It supplies no per-capability
+or remaining-contract proof, so even its current 16/16 PASS cannot close this gate.
+The validator does not authenticate execution artifacts: remaining producing
+suites and exhaustive behavioral assertions stay open. Do not hand-author a
+PASS receipt. The schema unit fixture proves validation only; historical live
+summaries and source/test-path existence cannot establish full acceptance.
+
+Live acceptance requires a clean runner checkout and an image whose
+`org.opencontainers.image.revision` label equals that runner's full HEAD SHA.
+A mismatch fails before probing the image or issuing a client token. After
+inspection the harness uses the immutable image ID so concurrent retagging
+cannot substitute another image. Commit first, then build with that SHA.
+MCP evidence records only discovery, call counts and the independent result
+check; transcript and file-byte assertions remain mandatory.
 
 The Linux Podman live harness exercises chat, file tools, Bash, MCP, hooks,
 session pinning, dock synchronization, close-mid-turn continuation, pending permissions after reopen and two
