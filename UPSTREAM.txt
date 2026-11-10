@@ -1,1 +1,1 @@
-gpui-kamin-ide 1e9c36ac07e3bd7c62c7fd74aeaa6e8211d88187
+gpui-kamin-ide 151e67f0520cda866b59a5b717cf89285e244063
