@@ -10,6 +10,9 @@ paths=(package.json package-lock.json tsconfig.json src
   extensions/claude-bridge/extension
   extensions/claude-bridge/workspace
   extensions/claude-bridge/webview
+  extensions/claude-bridge/browser-client
+  extensions/claude-bridge/server/package.json
+  extensions/claude-bridge/server/src/core/pty/mcp-tools-defs.ts
   extensions/claude-bridge/server/src/ui/src/lib/terminal-console)
 sha="$(git -C "$src" rev-parse "$ref")"
 for p in "${paths[@]}"; do git -C "$here" rm -r -q --ignore-unmatch -- "$p"; done

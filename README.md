@@ -11,11 +11,14 @@ This is a **copy** of the web-client part of [dykamino-coder/gpui-kamin-ide](htt
 | `extensions/claude-bridge/workspace/` | The service in the container: files, shell, MCP, hooks, sessions, browser server, credentials, Module Federation preview proxy. `Dockerfile`, `PACKAGING.md`, `DESIGN.md`, `CREDENTIALS.md` live here. |
 | `extensions/claude-bridge/webview/` | The UI panels shared with KaminIDE. The browser entry is `src/browser/`. |
 | `extensions/claude-bridge/extension/` | The shared Bridge client runtime the workspace host reuses. |
+| `extensions/claude-bridge/workspace/HEADLESS.md` | `@kaminide/bridge-workspace-host`: the same service without a UI, for embedding in another application. Example: `workspace/examples/embedding/`. |
+| `extensions/claude-bridge/browser-client/` | `@kaminide/bridge-browser-client`: the framework-agnostic browser client the UI itself uses. |
+| `extensions/claude-bridge/server/package.json` | Bridge server version; the embedding packages are versioned with it. |
 | `extensions/claude-bridge/server/src/ui/src/lib/terminal-console/` | Terminal console code used by the browser build. |
 | `src/`, `package.json`, `package-lock.json`, `tsconfig.json` | Node host code from the monorepo that the container build includes. |
 | `builtin-extensions/claude-bridge/package.json` | Version source. |
 
-Source snapshot: see `UPSTREAM.txt`. To refresh it from the monorepo, run `scripts/sync-from-monorepo.sh <path-to-gpui-kamin-ide> [<ref>]`.
+Source snapshot: see `UPSTREAM.txt`. To refresh it from the monorepo, run `scripts/sync-from-monorepo.sh <path-to-gpui-kamin-ide> [<ref>]`. Synced paths are overwritten by every sync: change them in the monorepo, not here. Release tarballs of both packages are attached to the monorepo's GitHub Releases.
 
 ## Build and run
 
