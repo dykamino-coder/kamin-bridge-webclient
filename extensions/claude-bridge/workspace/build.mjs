@@ -15,7 +15,7 @@ await build({
 // Use the SAME BridgeHost and handler graph as the VSIX. Only the VS Code API
 // boundary is replaced; the host-compat IPC facade itself remains shared.
 await build({
-  entryPoints: { runtime: 'src/runtime.ts', cli: 'src/cli.ts' },
+  entryPoints: { runtime: 'src/runtime.ts', cli: 'src/cli.ts', headless: 'src/headless.ts' },
   outdir: 'dist',
   outExtension: { '.js': '.cjs' },
   bundle: true,
